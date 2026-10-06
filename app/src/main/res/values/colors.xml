@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="telefam_red">#FFC80815</color>
+    <color name="telefam_red_dark">#FF9E040F</color>
+    <color name="telefam_red_light">#FFFFEBEE</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>
