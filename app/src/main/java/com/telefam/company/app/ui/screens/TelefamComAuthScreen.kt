@@ -48,7 +48,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -82,6 +86,8 @@ fun TelefamComAuthScreen(
     onEmailChanged: (String) -> Unit,
     onSendOtpClicked: () -> Unit,
     onGoogleSignInClicked: () -> Unit,
+    onSelectGoogleAccount: (String, String?) -> Unit = { _, _ -> },
+    onDismissGoogleSheet: () -> Unit = {},
     onOtpDigitsChanged: (String) -> Unit,
     onVerifyOtpClicked: () -> Unit,
     onResendOtpClicked: () -> Unit,
@@ -190,6 +196,210 @@ fun TelefamComAuthScreen(
             }
 
             Spacer(modifier = Modifier.height(110.dp))
+        }
+
+        if (uiState.showGoogleAccountSheet) {
+            GoogleAccountChooserDialog(
+                initialEmail = uiState.emailInput,
+                onAccountSelected = { email, name ->
+                    onSelectGoogleAccount(email, name)
+                },
+                onDismiss = onDismissGoogleSheet
+            )
+        }
+    }
+}
+
+@Composable
+private fun GoogleAccountChooserDialog(
+    initialEmail: String,
+    onAccountSelected: (String, String?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val telefamColors = LocalTelefamColors.current
+    var customEmail by remember {
+        mutableStateOf(
+            if (initialEmail.contains("@")) initialEmail else "tysonwaings5430@gmail.com"
+        )
+    }
+    var customName by remember { mutableStateOf("Tyson Waings") }
+    var localError by remember { mutableStateOf<String?>(null) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            color = telefamColors.cardBackground,
+            shape = RoundedCornerShape(22.dp),
+            shadowElevation = 16.dp,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 22.dp, vertical = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                GoogleBrandIcon(size = 32.dp)
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "Choose an account",
+                    color = telefamColors.textPrimary,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "to continue to Telefam",
+                    color = telefamColors.textSecondary,
+                    fontSize = 14.sp
+                )
+
+                Spacer(modifier = Modifier.height(18.dp))
+
+                // Quick tap primary Google Account card
+                Surface(
+                    color = telefamColors.inputBackground,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, telefamColors.inputBorder),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            onAccountSelected("tysonwaings5430@gmail.com", "Tyson Waings")
+                        }
+                        .testTag("google_quick_account_row")
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 12.dp)
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(telefamColors.brandRed)
+                        ) {
+                            Text(
+                                text = "T",
+                                color = Color.White,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Tyson Waings",
+                                color = telefamColors.textPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "tysonwaings5430@gmail.com",
+                                color = telefamColors.textSecondary,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                HorizontalDivider(color = telefamColors.inputBorder)
+                Spacer(modifier = Modifier.height(14.dp))
+
+                Text(
+                    text = "Or sign in with another Google account",
+                    color = telefamColors.textSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+
+                OutlinedTextField(
+                    value = customEmail,
+                    onValueChange = {
+                        customEmail = it
+                        localError = null
+                    },
+                    singleLine = true,
+                    placeholder = { Text("name@gmail.com", fontSize = 13.sp) },
+                    shape = RoundedCornerShape(10.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = telefamColors.inputBackground,
+                        unfocusedContainerColor = telefamColors.inputBackground,
+                        focusedBorderColor = telefamColors.brandRed,
+                        unfocusedBorderColor = telefamColors.inputBorder,
+                        focusedTextColor = telefamColors.textPrimary,
+                        unfocusedTextColor = telefamColors.textPrimary
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("google_sheet_email_input")
+                )
+
+                if (localError != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = localError!!,
+                        color = Color(0xFFD32F2F),
+                        fontSize = 12.sp,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, telefamColors.inputBorder),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                    ) {
+                        Text(
+                            text = "Cancel",
+                            color = telefamColors.textSecondary,
+                            fontSize = 14.sp
+                        )
+                    }
+                    Button(
+                        onClick = {
+                            val trimmed = customEmail.trim()
+                            if (!trimmed.contains("@") || !trimmed.contains(".")) {
+                                localError = "Enter a valid Google email"
+                            } else {
+                                onAccountSelected(
+                                    trimmed,
+                                    customName.takeIf { it.isNotBlank() }
+                                )
+                            }
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = telefamColors.brandRed,
+                            contentColor = Color.White
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(44.dp)
+                            .testTag("google_sheet_continue_button")
+                    ) {
+                        Text(
+                            text = "Continue",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
         }
     }
 }

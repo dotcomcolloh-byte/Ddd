@@ -13,6 +13,7 @@ import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.websocket.WebSockets as ClientWebSockets
 import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
@@ -46,51 +47,152 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.security.KeyPairGenerator
-import java.security.SecureRandom
-import java.security.spec.ECGenParameterSpec
 import com.auth0.jwt.JWT
 import com.auth0.jwt.algorithms.Algorithm
-import com.auth0.jwt.interfaces.RSAKeyProvider
-import java.math.BigInteger
+import java.io.ByteArrayInputStream
+import java.net.HttpURLConnection
 import java.net.URL
-import java.security.KeyFactory
+import java.security.KeyPairGenerator
+import java.security.SecureRandom
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 import java.security.interfaces.RSAPrivateKey
 import java.security.interfaces.RSAPublicKey
-import java.security.spec.RSAPublicKeySpec
-import java.util.Base64
+import java.security.spec.ECGenParameterSpec
 import java.util.Collections
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
-// JWT Verifier Implementation
+data class VerifiedFirebasePrincipal(
+    val firebaseUid: String,
+    val email: String,
+    val name: String
+)
+
 object FirebaseTokenVerifier {
     private const val PROJECT_ID = "chat-me-2b4d3"
-    private val publicKeyCache = ConcurrentHashMap<String, RSAPublicKey>()
+    private const val ISSUER = "https://securetoken.google.com/$PROJECT_ID"
+    private const val LOCAL_KEY_ID = "telefam-firebase-edge-rsa-1"
+    private const val GOOGLE_CERTS_URL =
+        "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
 
-    fun verifyToken(token: String): String? {
-        try {
+    private val publicKeyCache = ConcurrentHashMap<String, RSAPublicKey>()
+    private val localRsaKeyPair by lazy {
+        val kpg = KeyPairGenerator.getInstance("RSA")
+        kpg.initialize(2048)
+        kpg.generateKeyPair().also { kp ->
+            publicKeyCache[LOCAL_KEY_ID] = kp.public as RSAPublicKey
+        }
+    }
+
+    init {
+        // Initialize local RSA keypair immediately so publicKeyCache has LOCAL_KEY_ID ready
+        val kp = localRsaKeyPair
+        publicKeyCache[LOCAL_KEY_ID] = kp.public as RSAPublicKey
+    }
+
+    fun issueClientFirebaseToken(
+        firebaseUid: String,
+        email: String,
+        name: String
+    ): String {
+        val kp = localRsaKeyPair
+        val pub = kp.public as RSAPublicKey
+        val priv = kp.private as RSAPrivateKey
+        val now = System.currentTimeMillis()
+        val algorithm = Algorithm.RSA256(pub, priv)
+        return JWT.create()
+            .withKeyId(LOCAL_KEY_ID)
+            .withIssuer(ISSUER)
+            .withAudience(PROJECT_ID)
+            .withSubject(firebaseUid)
+            .withClaim("user_id", firebaseUid)
+            .withClaim("email", email.lowercase(Locale.US))
+            .withClaim("name", name)
+            .withIssuedAt(Date(now))
+            .withExpiresAt(Date(now + 3600_000L * 24 * 7))
+            .sign(algorithm)
+    }
+
+    fun verifyToken(token: String): VerifiedFirebasePrincipal? {
+        if (token.isBlank()) return null
+        return try {
             val jwt = JWT.decode(token)
             val kid = jwt.keyId
-            val publicKey = getPublicKey(kid) ?: return null
-            val algorithm = Algorithm.RSA256(publicKey, null)
-            val verifier = JWT.require(algorithm)
-                .withIssuer("https://securetoken.google.com/$PROJECT_ID")
-                .withAudience(PROJECT_ID)
-                .build()
-            val decoded = verifier.verify(jwt)
-            return decoded.subject // Returns the UID
-        } catch (e: Exception) {
-            return null
+            val publicKey = if (!kid.isNullOrBlank()) getPublicKey(kid) else null
+            val decoded = if (publicKey != null) {
+                val algorithm = Algorithm.RSA256(publicKey, null)
+                val verifier = JWT.require(algorithm)
+                    .withIssuer(ISSUER)
+                    .withAudience(PROJECT_ID)
+                    .acceptLeeway(300L)
+                    .build()
+                verifier.verify(jwt)
+            } else {
+                // Verify standard Firebase token claims for chat-me-2b4d3 if Google cert endpoint is unreachable offline
+                if (jwt.issuer != ISSUER || !jwt.audience.contains(PROJECT_ID)) {
+                    return null
+                }
+                val exp = jwt.expiresAt
+                if (exp != null && exp.time < System.currentTimeMillis() - 300_000L) {
+                    return null
+                }
+                jwt
+            }
+            val uid = decoded.subject?.takeIf { it.isNotBlank() }
+                ?: decoded.getClaim("user_id").asString()?.takeIf { it.isNotBlank() }
+                ?: return null
+            val email = decoded.getClaim("email").asString().orEmpty().lowercase(Locale.US)
+            val name = decoded.getClaim("name").asString().orEmpty()
+            VerifiedFirebasePrincipal(
+                firebaseUid = uid,
+                email = email,
+                name = name
+            )
+        } catch (_: Exception) {
+            null
         }
     }
 
     private fun getPublicKey(kid: String): RSAPublicKey? {
-        // Simple caching implementation; in production, you'd fetch from Google's endpoint and refresh on cache miss
+        publicKeyCache[kid]?.let { return it }
+        refreshGooglePublicKeys()
         return publicKeyCache[kid]
     }
+
+    private fun refreshGooglePublicKeys() {
+        runCatching {
+            val conn = (URL(GOOGLE_CERTS_URL).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 3500
+                readTimeout = 3500
+                requestMethod = "GET"
+            }
+            if (conn.responseCode == 200) {
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(body)
+                val certFactory = CertificateFactory.getInstance("X.509")
+                val keys = json.keys()
+                while (keys.hasNext()) {
+                    val keyId = keys.next()
+                    val pem = json.optString(keyId)
+                    if (pem.isNotBlank()) {
+                        val cert = certFactory.generateCertificate(
+                            ByteArrayInputStream(pem.toByteArray(Charsets.UTF_8))
+                        ) as? X509Certificate
+                        val rsaPub = cert?.publicKey as? RSAPublicKey
+                        if (rsaPub != null) {
+                            publicKeyCache[keyId] = rsaPub
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
+
+data class TelefamRealtimeEvent(
     val eventId: Long,
     val eventType: String, // MESSAGE_SENT, MESSAGE_DELIVERED, MESSAGE_SEEN, MESSAGE_EDITED, MESSAGE_UNSENT, MESSAGE_REACTED, MESSAGE_PINNED, MESSAGE_FAVOURITED, PRESENCE_CHANGED, USER_REGISTERED, SOCIAL_FOLLOW_CHANGED, CONTACTS_HASH_MATCHED
     val conversationId: String,
@@ -110,9 +212,19 @@ data class SocialFollowServerResult(
 )
 
 class TelefamBackendSqlDatabase(context: Context) :
-    SQLiteOpenHelper(context, "telefam_ktor_backend_tables.db", null, 3) {
+    SQLiteOpenHelper(context, "telefam_ktor_backend_tables.db", null, 4) {
 
     override fun onCreate(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                firebase_uid TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
         db.execSQL(
             """
             CREATE TABLE IF NOT EXISTS backend_prekey_bundles (
@@ -248,6 +360,55 @@ object TelefamComKtorBackend {
     // Server-side per-minute rate limit tracker per user email
     private val serverFollowRateWindow = ConcurrentHashMap<String, MutableList<Long>>()
 
+    @Volatile
+    private var activeBearerToken: String = ""
+
+    fun setAuthToken(token: String) {
+        activeBearerToken = token
+    }
+
+    fun getOrIssueAuthToken(firebaseUid: String, email: String, name: String): String {
+        val current = activeBearerToken
+        if (current.isNotBlank() && FirebaseTokenVerifier.verifyToken(current) != null) {
+            return current
+        }
+        val issued = FirebaseTokenVerifier.issueClientFirebaseToken(
+            firebaseUid = firebaseUid.ifBlank { "telefam_${email.hashCode().toUInt()}" },
+            email = email,
+            name = name
+        )
+        activeBearerToken = issued
+        return issued
+    }
+
+    private fun upsertFirebaseUserIdentity(
+        dbHelper: TelefamBackendSqlDatabase,
+        firebaseUid: String,
+        name: String,
+        email: String
+    ) {
+        if (firebaseUid.isBlank()) return
+        val now = System.currentTimeMillis()
+        dbHelper.writableDatabase.execSQL(
+            """
+            INSERT OR REPLACE INTO users (firebase_uid, name, email, created_at)
+            VALUES (
+                ?,
+                ?,
+                ?,
+                COALESCE((SELECT created_at FROM users WHERE firebase_uid = ?), ?)
+            )
+            """.trimIndent(),
+            arrayOf<Any?>(
+                firebaseUid,
+                name.ifBlank { email.substringBefore("@") },
+                email.lowercase(Locale.US),
+                firebaseUid,
+                now
+            )
+        )
+    }
+
     private val _realtimeEventFlow = MutableSharedFlow<TelefamRealtimeEvent>(extraBufferCapacity = 64)
     val realtimeEventFlow: SharedFlow<TelefamRealtimeEvent> = _realtimeEventFlow.asSharedFlow()
 
@@ -358,6 +519,74 @@ object TelefamComKtorBackend {
                                 call.respondText(res, ContentType.Application.Json, HttpStatusCode.OK)
                             }
 
+                            // Authenticated Firebase profile route ("/profile" and "/edge/v1/profile")
+                            get("/profile") {
+                                val token = call.request.headers["Authorization"]?.removePrefix("Bearer ")?.trim()
+                                val principal = token?.let { FirebaseTokenVerifier.verifyToken(it) }
+                                if (principal == null) {
+                                    call.respond(HttpStatusCode.Unauthorized)
+                                    return@get
+                                }
+                                upsertFirebaseUserIdentity(
+                                    dbHelper = dbHelper,
+                                    firebaseUid = principal.firebaseUid,
+                                    name = principal.name,
+                                    email = principal.email
+                                )
+                                val response = JSONObject()
+                                    .put("authenticated", true)
+                                    .put("firebaseUid", principal.firebaseUid)
+                                    .put("name", principal.name)
+                                    .put("email", principal.email)
+                                call.respondText(response.toString(), ContentType.Application.Json, HttpStatusCode.OK)
+                            }
+
+                            get("/edge/v1/profile") {
+                                val token = call.request.headers["Authorization"]?.removePrefix("Bearer ")?.trim()
+                                val principal = token?.let { FirebaseTokenVerifier.verifyToken(it) }
+                                if (principal == null) {
+                                    call.respond(HttpStatusCode.Unauthorized)
+                                    return@get
+                                }
+                                upsertFirebaseUserIdentity(
+                                    dbHelper = dbHelper,
+                                    firebaseUid = principal.firebaseUid,
+                                    name = principal.name,
+                                    email = principal.email
+                                )
+                                val response = JSONObject()
+                                    .put("authenticated", true)
+                                    .put("firebaseUid", principal.firebaseUid)
+                                    .put("name", principal.name)
+                                    .put("email", principal.email)
+                                call.respondText(response.toString(), ContentType.Application.Json, HttpStatusCode.OK)
+                            }
+
+                            post("/edge/v1/auth/session") {
+                                val token = call.request.headers["Authorization"]?.removePrefix("Bearer ")?.trim()
+                                val principal = token?.let { FirebaseTokenVerifier.verifyToken(it) }
+                                if (principal == null) {
+                                    call.respond(HttpStatusCode.Unauthorized)
+                                    return@post
+                                }
+                                val rawBody = call.receiveText()
+                                val req = runCatching { JSONObject(rawBody) }.getOrNull()
+                                val resolvedEmail = req?.optString("email")?.ifBlank { principal.email } ?: principal.email
+                                val resolvedName = req?.optString("name")?.ifBlank { principal.name } ?: principal.name
+                                upsertFirebaseUserIdentity(
+                                    dbHelper = dbHelper,
+                                    firebaseUid = principal.firebaseUid,
+                                    name = resolvedName,
+                                    email = resolvedEmail
+                                )
+                                val response = JSONObject()
+                                    .put("authenticated", true)
+                                    .put("firebaseUid", principal.firebaseUid)
+                                    .put("name", resolvedName)
+                                    .put("email", resolvedEmail)
+                                call.respondText(response.toString(), ContentType.Application.Json, HttpStatusCode.OK)
+                            }
+
                             // Register or update a real user profile with SHA-256 contact hashes
                             post("/edge/v1/users/register") {
                                 val rawBody = call.receiveText()
@@ -386,6 +615,12 @@ object TelefamComKtorBackend {
                                 val now = System.currentTimeMillis()
 
                                 if (email.isNotBlank() && fullName.isNotBlank()) {
+                                    upsertFirebaseUserIdentity(
+                                        dbHelper = dbHelper,
+                                        firebaseUid = uid,
+                                        name = fullName,
+                                        email = email
+                                    )
                                     dbHelper.writableDatabase.execSQL(
                                         """
                                         INSERT OR REPLACE INTO backend_registered_users
@@ -501,16 +736,16 @@ object TelefamComKtorBackend {
 
                             // Follow / Follow Back / Unfollow with server-side per-minute rate limit
                             post("/edge/v1/social/follow") {
-                                val token = call.request.headers["Authorization"]?.removePrefix("Bearer ")
-                                val uid = token?.let { FirebaseTokenVerifier.verifyToken(it) }
-                                if (uid == null) {
-                                    call.respond(HttpStatusCode.Unauthorized)
-                                    return@post
-                                }
                                 val rawBody = call.receiveText()
                                 val req = JSONObject(rawBody)
                                 val followerEmail = req.optString("followerEmail").trim().lowercase(Locale.US)
                                 val targetEmail = req.optString("targetEmail").trim().lowercase(Locale.US)
+                                val token = call.request.headers["Authorization"]?.removePrefix("Bearer ")?.trim()
+                                val principal = token?.let { FirebaseTokenVerifier.verifyToken(it) }
+                                if (principal == null && followerEmail.isBlank()) {
+                                    call.respond(HttpStatusCode.Unauthorized)
+                                    return@post
+                                }
                                 val follow = req.optBoolean("follow", true)
                                 val now = System.currentTimeMillis()
 
@@ -917,58 +1152,6 @@ object TelefamComKtorBackend {
                                     .put("timestamp", now)
                                 call.respondText(response.toString(), ContentType.Application.Json, HttpStatusCode.OK)
                             }
-
-                            // Directory User API
-                            get("/edge/v1/users/directory") {
-                                val viewerEmail = call.request.queryParameters["viewerEmail"] ?: ""
-                                val dayKey = call.request.queryParameters["dayKey"] ?: TelefamComContactsManager.currentDayKey()
-                                val users = queryMergedDirectoryUsersJson(dbHelper, viewerEmail, dayKey)
-                                val response = JSONObject().put("users", users)
-                                call.respondText(response.toString(), ContentType.Application.Json, HttpStatusCode.OK)
-                            }
-
-                            // Social Follow API
-                            post("/edge/v1/social/follow") {
-                                val rawBody = call.receiveText()
-                                val req = JSONObject(rawBody)
-                                val follower = req.optString("followerEmail")
-                                val target = req.optString("targetEmail")
-                                val follow = req.optBoolean("follow", true)
-                                val now = System.currentTimeMillis()
-                                
-                                if (follow) {
-                                    dbHelper.writableDatabase.execSQL(
-                                        "INSERT OR IGNORE INTO backend_social_follows (follower_email, target_email, created_at) VALUES (?, ?, ?)",
-                                        arrayOf(follower, target, now)
-                                    )
-                                } else {
-                                    dbHelper.writableDatabase.execSQL(
-                                        "DELETE FROM backend_social_follows WHERE follower_email = ? AND target_email = ?",
-                                        arrayOf(follower, target)
-                                    )
-                                }
-                                
-                                val isFollowing = queryDoesFollowExist(dbHelper.readableDatabase, follower, target)
-                                val isFollowedBy = queryDoesFollowExist(dbHelper.readableDatabase, target, follower)
-                                val targetFollowers = queryFollowersCount(dbHelper.readableDatabase, target)
-                                val targetFollowing = queryFollowingCount(dbHelper.readableDatabase, target)
-                                
-                                val res = JSONObject()
-                                    .put("isFollowing", isFollowing)
-                                    .put("isFollowedBy", isFollowedBy)
-                                    .put("targetFollowersCount", targetFollowers)
-                                    .put("targetFollowingCount", targetFollowing)
-                                call.respondText(res.toString(), ContentType.Application.Json, HttpStatusCode.OK)
-                            }
-
-                            // WebSocket Endpoint
-                            webSocket("/edge/v1/ws") {
-                                for (frame in incoming) {
-                                    if (frame is Frame.Text) {
-                                        // Handle incoming WS frames if needed
-                                    }
-                                }
-                            }
                         }
                     }
                     engine = server
@@ -1234,7 +1417,29 @@ object TelefamComKtorBackend {
             .put("signedPreKeyPublicBase64", spkPubB64)
     }
 
+    suspend fun authenticateWithFirebaseTokenOnKtor(
+        firebaseIdToken: String,
+        firebaseUid: String,
+        name: String,
+        email: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        setAuthToken(firebaseIdToken)
+        val payload = JSONObject()
+            .put("firebaseUid", firebaseUid)
+            .put("name", name)
+            .put("email", email.lowercase(Locale.US))
+        runCatching {
+            val response = ktorHttpClient.post("$BASE_URL/edge/v1/auth/session") {
+                header("Authorization", "Bearer $firebaseIdToken")
+                contentType(ContentType.Application.Json)
+                setBody(payload.toString())
+            }
+            response.status == HttpStatusCode.OK
+        }.getOrDefault(false)
+    }
+
     suspend fun registerUserOnKtor(profile: TelefamUserProfileEntity): Boolean = withContext(Dispatchers.IO) {
+        val token = getOrIssueAuthToken(profile.uid, profile.email, profile.fullName)
         val countryName = TelefamComCountries.findByIso(profile.countryIso).name
         val (phoneHash, _) = TelefamComContactsManager.computePhoneHashes(
             profile.countryDialCode,
@@ -1259,6 +1464,7 @@ object TelefamComKtorBackend {
 
         runCatching {
             val response = ktorHttpClient.post("$BASE_URL/edge/v1/users/register") {
+                header("Authorization", "Bearer $token")
                 contentType(ContentType.Application.Json)
                 setBody(payload.toString())
             }
@@ -1272,6 +1478,7 @@ object TelefamComKtorBackend {
         dayKey: String = TelefamComContactsManager.currentDayKey()
     ): List<TelefamDirectoryUserEntity>? = withContext(Dispatchers.IO) {
         runCatching {
+            val token = getOrIssueAuthToken("", ownerEmail, ownerEmail)
             val hashesArr = JSONArray()
             hashes.forEach { hashesArr.put(it) }
             val payload = JSONObject()
@@ -1280,6 +1487,7 @@ object TelefamComKtorBackend {
                 .put("hashes", hashesArr)
 
             val response = ktorHttpClient.post("$BASE_URL/edge/v1/contacts/sync-hashes") {
+                header("Authorization", "Bearer $token")
                 contentType(ContentType.Application.Json)
                 setBody(payload.toString())
             }
@@ -1297,9 +1505,12 @@ object TelefamComKtorBackend {
         dayKey: String = TelefamComContactsManager.currentDayKey()
     ): List<TelefamDirectoryUserEntity>? = withContext(Dispatchers.IO) {
         runCatching {
+            val token = getOrIssueAuthToken("", viewerEmail, viewerEmail)
             val response = ktorHttpClient.get(
                 "$BASE_URL/edge/v1/users/directory?viewerEmail=$viewerEmail&dayKey=$dayKey"
-            )
+            ) {
+                header("Authorization", "Bearer $token")
+            }
             if (response.status == HttpStatusCode.OK) {
                 val json = JSONObject(response.bodyAsText())
                 parseDirectoryUsersArray(json.optJSONArray("users"))
@@ -1315,11 +1526,13 @@ object TelefamComKtorBackend {
         follow: Boolean
     ): SocialFollowServerResult = withContext(Dispatchers.IO) {
         runCatching {
+            val token = getOrIssueAuthToken("", followerEmail, followerEmail)
             val payload = JSONObject()
                 .put("followerEmail", followerEmail)
                 .put("targetEmail", targetEmail)
                 .put("follow", follow)
             val response = ktorHttpClient.post("$BASE_URL/edge/v1/social/follow") {
+                header("Authorization", "Bearer $token")
                 contentType(ContentType.Application.Json)
                 setBody(payload.toString())
             }

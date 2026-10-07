@@ -482,13 +482,63 @@ class TelefamComViewModel(
                         authenticatedEmail = result.email,
                         authenticatedUid = result.uid,
                         showGoogleAccountSheet = false,
+                        emailError = null,
                         currentScreen = target
                     )
                 }
-            } else if (!result.errorMessage.isNullOrBlank() && result.errorMessage != "GOOGLE_ACCOUNT_PROMPT_REQUIRED") {
+            } else if (result.errorMessage == "GOOGLE_ACCOUNT_PROMPT_REQUIRED") {
+                _uiState.update {
+                    it.copy(
+                        showGoogleAccountSheet = true,
+                        emailError = null
+                    )
+                }
+            } else if (!result.errorMessage.isNullOrBlank()) {
                 _uiState.update { it.copy(emailError = result.errorMessage) }
             }
         }
+    }
+
+    fun completeGoogleSignInWithAccount(
+        activity: Activity,
+        googleEmail: String,
+        displayName: String? = null
+    ) {
+        val trimmedEmail = googleEmail.trim().lowercase(Locale.US)
+        if (!repository.isValidEmail(trimmedEmail)) {
+            _uiState.update {
+                it.copy(emailError = "Please enter a valid Google email address")
+            }
+            return
+        }
+        viewModelScope.launch {
+            val result = repository.signInWithGoogle(
+                activity = activity,
+                fallbackGoogleEmail = trimmedEmail,
+                fallbackDisplayName = displayName
+            )
+            if (result.success) {
+                prefillProfileFieldsFromEmail(result.email, result.displayName)
+                val target = if (result.isFirstTimeProfileNeeded) {
+                    TelefamScreenDestination.PROFILE_SETUP
+                } else {
+                    TelefamScreenDestination.HOME
+                }
+                _uiState.update {
+                    it.copy(
+                        authenticatedEmail = result.email,
+                        authenticatedUid = result.uid,
+                        showGoogleAccountSheet = false,
+                        emailError = null,
+                        currentScreen = target
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissGoogleAccountSheet() {
+        _uiState.update { it.copy(showGoogleAccountSheet = false) }
     }
 
     private fun prefillProfileFieldsFromEmail(email: String, explicitDisplayName: String? = null) {

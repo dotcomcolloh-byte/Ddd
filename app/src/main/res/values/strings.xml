@@ -8,7 +8,6 @@
     <string name="send_otp">Send OTP</string>
     <string name="or_divider">or</string>
     <string name="continue_with_google">Continue with Google</string>
-    <string name="default_web_client_id" translatable="false">690981910278-ilc8s9asre897t0fl7rh4v6p7ai3dtad.apps.googleusercontent.com</string>
     <string name="enter_otp">Enter OTP</string>
     <string name="we_sent_verification_code">We sent a verification code to</string>
     <string name="verify_otp">Verify OTP</string>

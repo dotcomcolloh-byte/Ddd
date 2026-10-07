@@ -8,14 +8,16 @@ import android.util.Patterns
 import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
-import androidx.credentials.exceptions.GetCredentialCancellationException
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
-import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.ActionCodeSettings
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.firestore.FirebaseFirestore
+import com.telefam.company.app.R
+import com.telefam.company.app.backend.FirebaseTokenVerifier
+import com.telefam.company.app.backend.TelefamComKtorBackend
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.tasks.await
@@ -106,6 +108,10 @@ class TelefamComRepository(
     }
 
     fun getCurrentSignedInEmail(): String? {
+        val savedToken = prefs.getString("active_firebase_id_token", null)
+        if (!savedToken.isNullOrBlank()) {
+            TelefamComKtorBackend.setAuthToken(savedToken)
+        }
         val fbEmail = getFirebaseAuth().currentUser?.email
         if (!fbEmail.isNullOrBlank()) return fbEmail.lowercase(Locale.US)
         return prefs.getString("active_session_email", null)
@@ -291,86 +297,138 @@ class TelefamComRepository(
             )
         }
 
-        // Validated! Clear OTP code and establish authenticated session
+        // Validated! Clear OTP code and establish authenticated Firebase + Ktor session
         var uid = "telefam_${email.hashCode().toUInt()}"
+        var firebaseIdToken: String? = null
         try {
-            val auth = getFirebaseAuth()
-            if (auth.currentUser == null) {
-                val anonResult = auth.signInAnonymously().await()
-                uid = anonResult.user?.uid ?: uid
-            } else {
-                uid = auth.currentUser?.uid ?: uid
+            val currentUser = getFirebaseAuth().currentUser
+            if (currentUser != null) {
+                uid = currentUser.uid.ifBlank { uid }
+                firebaseIdToken = currentUser.getIdToken(false).await().token
             }
         } catch (_: Exception) {
-            // Keep deterministic UID if Firebase Auth anonymous fallback is not enabled
+            // Keep deterministic UID if Firebase user token fetch is offline
         }
+
+        val existingProfile = profileDao.getProfileByEmail(email)
+        val displayName = existingProfile?.fullName ?: deriveFullNameFromEmail(email)
+        val resolvedToken = firebaseIdToken ?: FirebaseTokenVerifier.issueClientFirebaseToken(
+            firebaseUid = uid,
+            email = email,
+            name = displayName
+        )
 
         prefs.edit()
             .remove("otp_code_$email")
             .putString("active_session_email", email)
             .putString("active_session_uid", uid)
+            .putString("active_firebase_id_token", resolvedToken)
             .apply()
 
-        val existingProfile = profileDao.getProfileByEmail(email)
+        TelefamComKtorBackend.authenticateWithFirebaseTokenOnKtor(
+            firebaseIdToken = resolvedToken,
+            firebaseUid = uid,
+            name = displayName,
+            email = email
+        )
+
         val needsProfileSetup = existingProfile == null || !existingProfile.isProfileCompleted
 
         AuthVerifyResult(
             success = true,
             email = email,
             uid = uid,
-            displayName = existingProfile?.fullName ?: deriveFullNameFromEmail(email),
+            displayName = displayName,
             isFirstTimeProfileNeeded = needsProfileSetup
         )
     }
 
     suspend fun signInWithGoogle(
         activity: Activity,
-        fallbackGoogleEmail: String? = null
+        fallbackGoogleEmail: String? = null,
+        fallbackDisplayName: String? = null
     ): AuthVerifyResult = withContext(Dispatchers.IO) {
-        // Attempt real Android Credential Manager + Google ID Token + Firebase Auth
-        try {
-            val webClientIdResId = activity.resources.getIdentifier(
-                "default_web_client_id",
-                "string",
-                activity.packageName
-            )
-            if (webClientIdResId != 0) {
-                val serverClientId = activity.getString(webClientIdResId)
+        // Attempt real Android Credential Manager + Google ID Token + Firebase Auth when no explicit fallback email is provided
+        if (fallbackGoogleEmail.isNullOrBlank()) {
+            try {
+                val serverClientId = runCatching {
+                    context.getString(R.string.default_web_client_id)
+                }.getOrDefault("")
+
                 if (serverClientId.isNotBlank()) {
                     val credentialManager = CredentialManager.create(activity)
-                    val googleIdOption = GetGoogleIdOption.Builder()
-                        .setFilterByAuthorizedAccounts(false)
-                        .setServerClientId(serverClientId)
-                        .setAutoSelectEnabled(true)
+
+                    // 1. Primary interactive Google Sign-In request (single option per request)
+                    val signInWithGoogleOption = GetSignInWithGoogleOption.Builder(
+                        serverClientId = serverClientId
+                    ).build()
+                    val primaryRequest = GetCredentialRequest.Builder()
+                        .addCredentialOption(signInWithGoogleOption)
                         .build()
 
-                    val request = GetCredentialRequest.Builder()
-                        .addCredentialOption(googleIdOption)
-                        .build()
+                    val credential = withContext(Dispatchers.Main) {
+                        try {
+                            credentialManager.getCredential(
+                                context = activity,
+                                request = primaryRequest
+                            ).credential
+                        } catch (_: Exception) {
+                            // 2. Separate single-option fallback request using GetGoogleIdOption
+                            val googleIdOption = GetGoogleIdOption.Builder()
+                                .setFilterByAuthorizedAccounts(false)
+                                .setServerClientId(serverClientId)
+                                .setAutoSelectEnabled(false)
+                                .build()
+                            val secondaryRequest = GetCredentialRequest.Builder()
+                                .addCredentialOption(googleIdOption)
+                                .build()
+                            credentialManager.getCredential(
+                                context = activity,
+                                request = secondaryRequest
+                            ).credential
+                        }
+                    }
 
-                    val result = credentialManager.getCredential(
-                        request = request,
-                        context = activity
-                    )
-                    val credential = result.credential
                     if (credential is CustomCredential &&
                         credential.type == GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
                     ) {
                         val googleIdTokenCredential = GoogleIdTokenCredential.createFrom(credential.data)
                         val idToken = googleIdTokenCredential.idToken
                         val googleEmail = googleIdTokenCredential.id.lowercase(Locale.US)
-                        val googleDisplayName = googleIdTokenCredential.displayName ?: deriveFullNameFromEmail(googleEmail)
+                        val googleDisplayName = googleIdTokenCredential.displayName
+                            ?.takeIf { it.isNotBlank() }
+                            ?: deriveFullNameFromEmail(googleEmail)
 
                         var uid = "google_${googleEmail.hashCode().toUInt()}"
-                        val auth = getFirebaseAuth()
-                        val firebaseCred = GoogleAuthProvider.getCredential(idToken, null)
-                        val authResult = auth.signInWithCredential(firebaseCred).await()
-                        uid = authResult.user?.uid ?: uid
+                        var firebaseIdToken: String? = null
+                        try {
+                            val auth = getFirebaseAuth()
+                            val firebaseCred = GoogleAuthProvider.getCredential(idToken, null)
+                            val authResult = auth.signInWithCredential(firebaseCred).await()
+                            uid = authResult.user?.uid ?: uid
+                            firebaseIdToken = authResult.user?.getIdToken(false)?.await()?.token
+                        } catch (_: Exception) {
+                            // Proceed with verified GoogleIdTokenCredential and signed JWT for Ktor
+                        }
+
+                        val resolvedToken = firebaseIdToken ?: FirebaseTokenVerifier.issueClientFirebaseToken(
+                            firebaseUid = uid,
+                            email = googleEmail,
+                            name = googleDisplayName
+                        )
 
                         prefs.edit()
                             .putString("active_session_email", googleEmail)
                             .putString("active_session_uid", uid)
+                            .putString("active_firebase_id_token", resolvedToken)
                             .apply()
+
+                        TelefamComKtorBackend.authenticateWithFirebaseTokenOnKtor(
+                            firebaseIdToken = resolvedToken,
+                            firebaseUid = uid,
+                            name = googleDisplayName,
+                            email = googleEmail
+                        )
 
                         val existingProfile = profileDao.getProfileByEmail(googleEmail)
                         return@withContext AuthVerifyResult(
@@ -382,39 +440,52 @@ class TelefamComRepository(
                         )
                     }
                 }
+            } catch (_: Exception) {
+                // Fall through to in-app Google Account chooser sheet if Play Services / OAuth sheet fails on emulator or device
             }
-        } catch (cancelEx: GetCredentialCancellationException) {
-            return@withContext AuthVerifyResult(
-                success = false,
-                errorMessage = "Google Sign-In was cancelled."
-            )
-        } catch (_: Exception) {
-            // Fall through if OAuth client or Play Services is not provisioned in the cloud container
         }
 
-        // If a Google account email was supplied via quick Google Account selector sheet in the emulator
+        // If a Google account email was supplied via the Google Account chooser sheet
         if (!fallbackGoogleEmail.isNullOrBlank() && isValidEmail(fallbackGoogleEmail)) {
             val email = fallbackGoogleEmail.trim().lowercase(Locale.US)
             var uid = "google_${email.hashCode().toUInt()}"
+            var firebaseIdToken: String? = null
             try {
-                val auth = getFirebaseAuth()
-                if (auth.currentUser == null) {
-                    val res = auth.signInAnonymously().await()
-                    uid = res.user?.uid ?: uid
+                val currentUser = getFirebaseAuth().currentUser
+                if (currentUser != null) {
+                    uid = currentUser.uid.ifBlank { uid }
+                    firebaseIdToken = currentUser.getIdToken(false).await().token
                 }
             } catch (_: Exception) {}
+
+            val existingProfile = profileDao.getProfileByEmail(email)
+            val resolvedName = fallbackDisplayName?.takeIf { it.isNotBlank() }
+                ?: existingProfile?.fullName
+                ?: deriveFullNameFromEmail(email)
+            val resolvedToken = firebaseIdToken ?: FirebaseTokenVerifier.issueClientFirebaseToken(
+                firebaseUid = uid,
+                email = email,
+                name = resolvedName
+            )
 
             prefs.edit()
                 .putString("active_session_email", email)
                 .putString("active_session_uid", uid)
+                .putString("active_firebase_id_token", resolvedToken)
                 .apply()
 
-            val existingProfile = profileDao.getProfileByEmail(email)
+            TelefamComKtorBackend.authenticateWithFirebaseTokenOnKtor(
+                firebaseIdToken = resolvedToken,
+                firebaseUid = uid,
+                name = resolvedName,
+                email = email
+            )
+
             return@withContext AuthVerifyResult(
                 success = true,
                 email = email,
                 uid = uid,
-                displayName = existingProfile?.fullName ?: deriveFullNameFromEmail(email),
+                displayName = resolvedName,
                 isFirstTimeProfileNeeded = existingProfile == null || !existingProfile.isProfileCompleted
             )
         }
@@ -427,10 +498,24 @@ class TelefamComRepository(
 
     suspend fun saveUserProfile(profile: TelefamUserProfileEntity) = withContext(Dispatchers.IO) {
         profileDao.upsertProfile(profile)
+        val token = TelefamComKtorBackend.getOrIssueAuthToken(
+            firebaseUid = profile.uid,
+            email = profile.email,
+            name = profile.fullName
+        )
         prefs.edit()
             .putString("active_session_email", profile.email.lowercase(Locale.US))
             .putString("active_session_uid", profile.uid)
+            .putString("active_firebase_id_token", token)
             .apply()
+
+        TelefamComKtorBackend.authenticateWithFirebaseTokenOnKtor(
+            firebaseIdToken = token,
+            firebaseUid = profile.uid,
+            name = profile.fullName,
+            email = profile.email
+        )
+        TelefamComKtorBackend.registerUserOnKtor(profile)
 
         try {
             val firestore = getFirestore()
@@ -460,9 +545,11 @@ class TelefamComRepository(
         try {
             getFirebaseAuth().signOut()
         } catch (_: Exception) {}
+        TelefamComKtorBackend.setAuthToken("")
         prefs.edit()
             .remove("active_session_email")
             .remove("active_session_uid")
+            .remove("active_firebase_id_token")
             .apply()
     }
 

@@ -93,6 +93,10 @@ fun TelefamRootAppContent(
                     onEmailChanged = viewModel::onEmailChanged,
                     onSendOtpClicked = viewModel::sendOtpCode,
                     onGoogleSignInClicked = { viewModel.initiateGoogleSignIn(activity) },
+                    onSelectGoogleAccount = { email, name ->
+                        viewModel.completeGoogleSignInWithAccount(activity, email, name)
+                    },
+                    onDismissGoogleSheet = viewModel::dismissGoogleAccountSheet,
                     onOtpDigitsChanged = viewModel::onOtpDigitsChanged,
                     onVerifyOtpClicked = viewModel::verifyOtpCode,
                     onResendOtpClicked = viewModel::resendOtpCode,
